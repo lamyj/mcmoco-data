@@ -1,0 +1,114 @@
+---
+title: "Analysis of the efficiency of MC-MoCo"
+author: L. Soustelle, J. Lamy, A. Le Troter, M. Guye, J.-P. Ranjeva, F. Munsch, G.
+  Varma, D. Alsop, J. Pelletier, O. Girard, G. Duhamel
+date: ''
+---
+
+```{r echo=FALSE, message=FALSE}
+library(ggplot2)
+library(gridExtra)
+library(knitr)
+library(multcomp)
+library(nlme)
+```
+
+This document contains the statistical analysis described in *A Motion Correction Strategy for Multi-Contrast based 3D parametric imaging: Application to Inhomogeneous Magnetization Transfer (ihMT)*, by L. Soustelle et al., to appear in *Magnetic Resonance in Medicine*. The source code of this document, and its related data, is available at https://github.com/lamyj/mcmoco-data/.
+
+The data contains in each row contains the position in physical space of one marker of one ihMT-weighted image of one subject, placed either before motion-correction (*Pre-MoCo*) or after application of a motion-correction algorithm (*MC-MoCo* or *MCFLIRT*).
+
+```{r}
+positions = read.csv("positions.csv", colClasses=c(Volume="factor"))
+kable(head(positions))
+```
+
+# Quantification of the residual motion
+
+For each subject and each set of images (uncorrected, MCFLIRT- and MC-MoCo-corrected), a reference point of each landmark is defined as the centroid of the landmark locations across the images of the set.
+
+```{r}
+references = aggregate(
+    cbind(x, y, z) ~ Subject + Marker + Method, positions, mean)
+```
+
+The reference points are used to quantify the amount of native motion (uncorrected images) and residual motion (MCFLIRT- and MC-MoCo-corrected images) by averaging the distances between the reference points and their corresponding landmarks across all the subjects.
+
+```{r}
+df = merge(
+    positions, references, by=c("Subject", "Marker", "Method"), 
+    suffixes=c("", "_c"))
+df$Distance = sapply(
+    1:nrow(df), 
+    function(i) { with(df[i,], norm(c(x, y, z) - c(x_c, y_c, z_c), "2")) })
+distances = aggregate(Distance ~ Subject + Marker + Method, df, mean)
+```
+
+A boxplot of the native motion evaluated on the images before motion correction and of residual motion evaluated after application of MCFLIRT and MC-MoCo show a lower residual motion for MC-MoCo compared to that of MCFLIRT for all landmarks. The residual motion value is additionally rather constant across all markers for MC-MoCo.
+
+```{r echo=FALSE, message=FALSE}
+# Re-order factor to improve readability of plot.
+distances$Method = factor(distances$Method, c("Pre-MoCo", "MCFLIRT", "MC-MoCo"))
+distances$Marker = factor(
+    distances$Marker, c("R-SFG", "R-PCG", "L-MFG", "LR-SCCG"))
+
+plot = (
+    ggplot(distances, aes(Method, Distance, color=Marker)) +
+    geom_boxplot()+ylab("Native/Residual motion (mm)"))
+ggsave("motion.png", plot)
+print(plot)
+```
+
+# Statistical analysis
+
+To evaluate the performance of MC-MoCo and MCFLIRT, and to verify that the behavior of both methods is constant across landmarks and between the two groups of subjects, we use a mixed-effect linear model with fixed effects for the motion correction method, the landmark, and the subject group (deduced from the subject ID), and with a random effect for the subject to account for the non-independence of the observations within a subject.
+
+```{r}
+# Deduce Group factor from subject ID
+distances$Group = as.factor(
+    sapply(distances$Subject, sub, pattern="(.*)_.*", replacement="\\1"))
+# Re-order to improve readability of hypothesis testing.
+distances$Method = factor(distances$Method, c("MC-MoCo", "MCFLIRT", "Pre-MoCo"))
+model = lme(Distance ~ Method + Marker + Group, random=~1|Subject, distances)
+```
+
+The residuals of the mixed-effects linear model show neither deviation from a normal distribution (Shapiro-Wilk test, p=`r format.pval(shapiro.test(residuals(model))$p.value, digits=3)`) nor apparent structure in the variance of the residuals, thus validating the model.
+
+```{r echo=FALSE}
+info = data.frame(Residuals=residuals(model), Fitted=fitted(model))
+qq_plot = ggplot(info, aes(sample=Residuals)) + geom_qq() + geom_qq_line()
+residuals_plot = ggplot(info, aes(Fitted, Residuals)) + geom_point()
+grid.arrange(qq_plot, residuals_plot, ncol=2)
+```
+
+The analysis of the individual factors shows a significant effect of the motion-correction methods, indicating a difference between the non-corrected images and the motion-corrected images, but no difference either across the landmarks or between the two groups of subjects, thereby indicating that differences in residual motions depends only on the algorithm.
+
+```{r echo=FALSE}
+df = as.data.frame(anova(model))
+df$`p-value` = format.pval(df$`p-value`, digits=3, eps=1e-10)
+kable(df, digits=3, align="lrrrr")
+```
+
+Further linear hypotheses tests comparing the native motion from residual motions derived from MCFLIRT and MC-MoCo show statistically significant reductions for MCFLIRT and for MC-MoCo as well as signficant reduction of MC-MoCo compared to MCFLIRT.
+
+```{r}
+hypotheses = glht(model, linfct=mcp(Method="Tukey"))
+```
+
+```{r echo=FALSE}
+comparisons = summary(hypotheses)
+# From the source of multcomp
+pq = comparisons$test
+mtests = data.frame(
+    pq$coefficients, pq$sigma, pq$tstat, format.pval(pq$pvalues, eps=1e-10),
+    stringsAsFactors=FALSE)
+letter = ifelse(comparisons$df == 0, "z", "t")
+pname = switch(
+    comparisons$alternativ,
+    less=paste0("Pr(<", letter, ")"),
+    greater=paste0("Pr(>", letter, ")"),
+    two.sided=paste0("Pr(>|", letter, "|)"))
+colnames(mtests) = c("Estimate", "Std. Error", paste(letter, "value"), pname)
+alt = switch(comparisons$alternative, two.sided="==", less=">=", greater="<=")
+rownames(mtests) = paste(rownames(mtests), alt, comparisons$rhs)
+kable(mtests, digits=3)
+```
